@@ -29,7 +29,9 @@ from sqlalchemy import text
 from datetime import timedelta
 from utils.DbUtil import get_session, update_status_by_id, update_rt_status_by_id, get_sf_session, calculate_percentage_change
 from utils.utils_helper import sanitize_filter_value, build_days_open_filter, build_in_clause_filter
-from utils.utils_helper import create_error_response, validate_optional_param
+from utils.utils_helper import (create_error_response, validate_optional_param,validate_dual_series_structure,
+                                get_requested_tiles,validate_tiles,get_additional_params,
+                                process_tile,validate_dual_series_batch_compatibility,validate_tile_name)
 from utils.query_templates import (PowerBIReports, OverviewSummaryKPI, OverviewPageCharts, AllAnomaliesSummaryKPI, 
                                    AllAnomaliesPageCharts, AllAccountsSummaryKPI, AccountDetailsKPI, PharmacyDetailsKPI,
                                    AccountDetailsCharts, AnomalyDetailsKPI,PurchaseDispenseExp)
@@ -52,6 +54,7 @@ ALLOWED_ORIGIN = "*"
 ANOMALY_STR_DATE_FORMAT = "%m/%d/%Y"
 AWS_REGION="us-east-1"
 CONNECTION_FAILED = "Database connection failed"
+DAYS_OPEN_DEFAULT = "0 Days"
 DISP_LABEL_340B = "340B Dispense Quantity"
 DISP_LABEL_NON_340B = "Non 340B Dispense Quantity"
 DISPENSE_QUANTITY = "Dispense Quantity"
@@ -74,6 +77,7 @@ THE_VIEW_RETURNED_NO_DATA = "The view returned no data"
 UPLOAD_BUCKET_NAME = os.getenv("DD340B_BUCKET_NAME", "default-340b-bucket") # bucket name fetched from cdk.json
 UPLOAD_URL_EXPIRATION = 120 # 2 minutes expiration for presigned url
 VIEW_NOT_FOUND = "View not found"
+MISSING_REQUIRED_PARAMETER = "Missing required parameter"
 
 
 @lru_cache(maxsize=1)
@@ -156,31 +160,71 @@ def fetch_cecp_lookupdata():
     print("fetch_cecp_lookupdata called") 
 
     try:  
-        # Import database utilities for querying
-        from utils.DbUtil import get_session
-        from sqlalchemy import text
-        
-        # Query the view directly
+        # Get optional query parameters for dependent filtering
+        query_params = app.current_event.query_string_parameters or {}
+        id_340b = query_params.get('340bId')
+        pharmacy_id = query_params.get('pharmacyId')
+
+        # Validate: cannot pass both parameters
+        if id_340b and pharmacy_id:
+            return {
+                "error": INVALID_PARAMS,
+                "message": "Cannot specify both 340bId and pharmacyId. Provide exactly one or none."
+            }
+
         session = get_session()
 
-        ce_result = session.execute(text("SELECT DISTINCT p.340BID as AccountID, c.Entity_Name FROM `340B_340BPurchases` p JOIN `340B_CoveredEntities` c ON p.340BID = c.340B_ID")).fetchall()
-        
+        # Mode 1: 340bId provided → return all CEs + only affiliated CPs
+        # Mode 2: pharmacyId provided → return only affiliated CEs + all CPs
+        # Mode 3: no params → return all CEs and all CPs
+
+        if id_340b:
+            # 340bId provided → skip CE query, return only affiliated CPs
+            ce_result = []
+            cp_result = session.execute(text(
+                "SELECT DISTINCT cp.Pharmacy_ID as PharmacyID, cp.Pharmacy_Name, cp.State "
+                "FROM `340B_ContractPharmacies` cp "
+                "INNER JOIN `340B_CoveredEntitiesContractPharmacies` cecp ON cp.Pharmacy_ID = cecp.Pharmacy_ID "
+                "WHERE cecp.`340B_ID` = :id_340b"
+            ), {"id_340b": id_340b}).fetchall()
+        elif pharmacy_id:
+            # pharmacyId provided → skip CP query, return only affiliated CEs
+            ce_result = session.execute(text(
+                "SELECT DISTINCT ce.`340B_ID` as AccountID, ce.Entity_Name, ce.State "
+                "FROM `340B_CoveredEntities` ce "
+                "INNER JOIN `340B_CoveredEntitiesContractPharmacies` cecp ON ce.`340B_ID` = cecp.`340B_ID` "
+                "WHERE cecp.Pharmacy_ID = :pharmacy_id"
+            ), {"pharmacy_id": pharmacy_id}).fetchall()
+            cp_result = []
+        else:
+            # No filter - return all CEs and all CPs
+            ce_result = session.execute(text(
+                "SELECT DISTINCT ce.`340B_ID` as AccountID, ce.Entity_Name, ce.State "
+                "FROM `340B_CoveredEntities` ce "
+                "INNER JOIN `340B_CoveredEntitiesContractPharmacies` cecp ON ce.`340B_ID` = cecp.`340B_ID`"
+            )).fetchall()
+            cp_result = session.execute(text(
+                "SELECT DISTINCT cp.Pharmacy_ID as PharmacyID, cp.Pharmacy_Name, cp.State "
+                "FROM `340B_ContractPharmacies` cp "
+                "INNER JOIN `340B_CoveredEntitiesContractPharmacies` cecp ON cp.Pharmacy_ID = cecp.Pharmacy_ID"
+            )).fetchall()
+
         ce_list = []
         if ce_result:
             for ce_row in ce_result:
                 ce_list.append({
                 "account_id": ce_row.AccountID,
-                "account_name": ce_row.Entity_Name
+                "account_name": f"{ce_row.Entity_Name}_{ce_row.AccountID}_{ce_row.State}" if ce_row.State else f"{ce_row.Entity_Name}_{ce_row.AccountID}",
+                "state": ce_row.State
             })  
 
-        cp_result = session.execute(text("SELECT DISTINCT p.PharmacyID, c.Pharmacy_Name FROM `340B_Non340BPurchases` p JOIN `340B_ContractPharmacies` c ON p.PharmacyID = c.Pharmacy_ID")).fetchall()
-        
         cp_list = []
         if cp_result:
             for cp_row in cp_result:
                 cp_list.append({
                 "pharmacy_id": cp_row.PharmacyID,
-                "pharmacy_name": cp_row.Pharmacy_Name
+                "pharmacy_name": f"{cp_row.Pharmacy_Name}_{cp_row.PharmacyID}_{cp_row.State}" if cp_row.State else f"{cp_row.Pharmacy_Name}_{cp_row.PharmacyID}",
+                "state": cp_row.State
             })  
 
         response["purchase-dispense-picklist"] = {
@@ -416,7 +460,7 @@ def _fetch_anomaly_details(session, anomaly_id: int):
         "pharmacyId": anomaly_details.Pharmacy_ID,
         "anomalyDate": anomaly_details.Anomaly_Date.strftime(ANOMALY_STR_DATE_FORMAT),
         "brand": anomaly_details.Anomaly_Brand,
-        "daysOpen": f"{(datetime.now().date() - anomaly_details.Anomaly_Date).days} Days",
+        "daysOpen": f"{anomaly_details.DaysOpen} Days",
         "anomalyDetectedBy": anomaly_details.Anomaly_Detected_By,
         "anomalySource": anomaly_details.Anomaly_Source,
         "action": anomaly_details.Anomaly_Status,
@@ -652,23 +696,25 @@ def _fetch_purchase_dispense_picklist(session):
     Internal method to fetch covered entities and contract pharmacies Ids from the database for purchase vs dispense explorer.
     """
     try:
-        ce_result = session.execute(text("SELECT DISTINCT p.340BID as AccountID, c.Entity_Name FROM `340B_340BPurchases` p JOIN `340B_CoveredEntities` c ON p.340BID = c.340B_ID")).fetchall()
+        ce_result = session.execute(text("SELECT DISTINCT p.340BID as AccountID, c.Entity_Name, c.State FROM `340B_340BPurchases` p JOIN `340B_CoveredEntities` c ON p.340BID = c.340B_ID")).fetchall()
         
         ce_list = []
         if ce_result:
             for ce_row in ce_result:
                 ce_list.append({
                 "account_id": ce_row.AccountID,
-                "account_name": ce_row.Entity_Name
+                "account_name": f"{ce_row.Entity_Name}_{ce_row.AccountID}_{ce_row.State}" if ce_row.State else f"{ce_row.Entity_Name}_{ce_row.AccountID}",
+                "state": ce_row.State
             })  
 
-        cp_result = session.execute(text("SELECT DISTINCT p.PharmacyID, c.Pharmacy_Name FROM `340B_Non340BPurchases` p JOIN `340B_ContractPharmacies` c ON p.PharmacyID = c.Pharmacy_ID")).fetchall()
+        cp_result = session.execute(text("SELECT DISTINCT p.PharmacyID, c.Pharmacy_Name, c.State FROM `340B_Non340BPurchases` p JOIN `340B_ContractPharmacies` c ON p.PharmacyID = c.Pharmacy_ID")).fetchall()
         cp_list = []
         if cp_result:
             for cp_row in cp_result:
                 cp_list.append({
                     "pharmacy_id": cp_row.PharmacyID,
-                    "pharmacy_name": cp_row.Pharmacy_Name
+                    "pharmacy_name": f"{cp_row.Pharmacy_Name}_{cp_row.PharmacyID}_{cp_row.State}" if cp_row.State else f"{cp_row.Pharmacy_Name}_{cp_row.PharmacyID}",
+                    "state": cp_row.State
                 })
         return {"covered_entities": ce_list, "contract_pharmacies": cp_list}
     except Exception as e:
@@ -728,7 +774,7 @@ def get_anomaly_details(account_id: str, anomaly_id: int):
                 }
             ]
             response["anomaly-kpis"] = {
-                "daysActive": {"count": (datetime.now().date() - datetime.strptime(anomaly_details.get("anomalyDate"), ANOMALY_STR_DATE_FORMAT).date()).days, "compareToPrevious" : 0.0},#fix it later
+                "daysActive": {"count": int(anomaly_details.get("daysOpen", DAYS_OPEN_DEFAULT).replace(" Days","")), "compareToPrevious" : 0.0},#fix it later
                 "duration": {"count": "1", "compareToPrevious" : 0.0},
                 "riskExposure": {"count": float(anomaly_kpis.get("anomalyWac")), "compareToPrevious" : 0.0},
                 "total340bVolume": {"count": int(anomaly_kpis.get("anomalyUnits")), "compareToPrevious" : 0.0}
@@ -1105,41 +1151,6 @@ def validate_limit_parameter(limit: str) -> tuple[bool, str, int]:
         return False, "Invalid limit parameter. Expected positive integer", None
 
 
-def validate_tile_name(tile_name: str) -> tuple[bool, str]:
-    """
-    Validate that a tile name follows kebab-case naming convention.
-    
-    Args:
-        tile_name: The tile name to validate
-    
-    Returns:
-        Tuple of (is_valid, error_message)
-        - is_valid: True if the tile name is valid, False otherwise
-        - error_message: Empty string if valid, error description if invalid
-    
-    Examples:
-        >>> validate_tile_name("anomalous-transactions")
-        (True, "")
-        >>> validate_tile_name("anomalousTransactions")
-        (False, "Invalid tile name format. Expected kebab-case (lowercase with hyphens)")
-        >>> validate_tile_name("ANOMALOUS-TRANSACTIONS")
-        (False, "Invalid tile name format. Expected kebab-case (lowercase with hyphens)")
-    """
-    if not tile_name:
-        return False, "Tile name cannot be empty"
-    
-    # Check if tile name follows kebab-case convention
-    # Should be lowercase letters, numbers, and hyphens only
-    # Should not start or end with hyphen
-    # Should not have consecutive hyphens
-    import re
-    kebab_case_pattern = r'^[a-z0-9]+(-[a-z0-9]+)*$'
-    
-    if not re.match(kebab_case_pattern, tile_name):
-        return False, "Invalid tile name format. Expected kebab-case (lowercase with hyphens)"
-    
-    return True, ""
-
 
 def _classify_database_error(exception: Exception, tile_name: str, table_name: str = "database table", is_view: bool = False) -> dict:
     """
@@ -1497,9 +1508,9 @@ def _get_status_mapping():
         'Under Investigation': 'Under Investigation',
         'Resolved': 'Resolved (after letter)',
         'False Positive': 'False Positive',
-        'Letter Sent': 'Letter Sent',
+        'Letter Sent': LETTER_SENT,
         'Under Internal Audit': 'Under Internal Audit',
-        'Pending': 'Letter Sent',  # Map "Pending" to LETTER_SENT
+        'Pending': LETTER_SENT,  # Map "Pending" to LETTER_SENT
     }
 
 
@@ -1822,6 +1833,86 @@ def get_anomalies_list_data(query_params: dict = None):
             session.close()
 
 
+def get_anomalies_list_overall_data(query_params: dict = None):
+    """
+    Fetch top 100 anomalies by anomaly score irrespective of recency.
+    
+    Database View: vwThreeFourtyBAnomaliesTableOverall
+    
+    This tile returns the top 100 anomalies ordered by linkage score (descending),
+    regardless of anomaly date. Unlike anomalies-list which shows the most recent
+    anomalies, this shows the highest-scoring anomalies overall.
+    
+    Args:
+        query_params: Optional dictionary of query parameters for filtering
+    
+    Returns:
+        List of dictionaries with the same column structure as anomalies-list.
+        On error, returns error object with "error", "message", and "tileName" fields.
+    """
+    tile_name = "anomalies-list-overall"
+    session = None
+    
+    try:
+        # Validate query parameters if provided
+        if query_params:
+            is_valid, error_response = validate_query_parameters(query_params, tile_name)
+            if not is_valid:
+                return error_response
+        
+        # Get database session
+        session = get_session()
+        
+        # Query the overall view - ordered by linkage score only, not by date
+        result = session.execute(text("""
+        SELECT
+            anomalyId,
+            accountId,
+            linkageScore,
+            anomalyEntityName,
+            brand,
+            anomalyDate,
+            daysOpen,
+            region,
+            units,
+            dollars,
+            action,
+            state,
+            city
+        FROM vwThreeFourtyBAnomaliesTableOverall """)).fetchall()
+        
+        # Handle no data case
+        if not result:
+            return []
+        
+        # Map view columns to response format
+        anomalies_list = []
+        for row in result:
+            anomalies_list.append({
+                "anomalyId": row.anomalyId,
+                "accountId": row.accountId,
+                "linkageScore": row.linkageScore,
+                "anomalyEntityName": row.anomalyEntityName,
+                "brand": row.brand,
+                "anomalyDate": row.anomalyDate,
+                "daysOpen": row.daysOpen,
+                "region": row.region,
+                "units": row.units,
+                "dollars": format_monetary_value(round(row.dollars)),
+                "action": row.action,
+                "state": row.state,
+                "city": row.city
+            })
+        
+        return anomalies_list
+        
+    except Exception as e:
+        logger.error(f"Error fetching {tile_name} data: {e}")
+        return _classify_database_error(e, tile_name, "vwThreeFourtyBAnomaliesTableOverall", is_view=True)
+    finally:
+        if session:
+            session.close()
+
 
 def get_accounts_summary_kpis_data(query_params: dict = None):
     """
@@ -1997,6 +2088,7 @@ def get_top_340b_accounts_data(query_params: dict = None):
             anomalies,
             brands,
             region,
+            state,
             chargeback,
             wac
         FROM vwTop340BAccounts
@@ -2028,6 +2120,7 @@ def get_top_340b_accounts_data(query_params: dict = None):
                 "anomalies": int(row.anomalies) if row.anomalies is not None else 0,
                 "brands": str(row.brands) if row.brands is not None else "",
                 "region": row.region or "Unknown",
+                "state": row.state or "Unknown",
                 "chargeback": chargeback_formatted,
                 "wac": wac_formatted
             })
@@ -2081,7 +2174,7 @@ def format_monetary_value(value):
         value: Numeric value to format
     
     Returns:
-        Formatted string with appropriate unit (e.g., "$125K", "$1.2M")
+        Formatted string with appropriate unit (e.g., "$125K", "$1.2M", "$1.5B")
     """
     if value is None or value == 0:
         return "$0"
@@ -2089,7 +2182,10 @@ def format_monetary_value(value):
     # Convert to float for calculations
     amount = float(value)
     
-    if amount >= 1000000:
+    if amount >= 1000000000:
+        # Format as billions
+        return f"${amount / 1000000000:.1f}B"
+    elif amount >= 1000000:
         # Format as millions
         return f"${amount / 1000000:.1f}M"
     elif amount >= 1000:
@@ -2154,6 +2250,7 @@ def get_contract_pharmacy_accounts_data(query_params: dict = None):
             anomalies,
             brands,
             region,
+            state,
             chargeback,
             wac
         FROM vwContractPharmacyAccounts
@@ -2185,6 +2282,7 @@ def get_contract_pharmacy_accounts_data(query_params: dict = None):
                 "anomalies": int(row.anomalies) if row.anomalies is not None else 0,
                 "brands": str(row.brands) if row.brands is not None else "",
                 "region": row.region or "Unknown",
+                "state": row.state or "Unknown",
                 "chargeback": chargeback_formatted,
                 "wac": wac_formatted
             })
@@ -3541,7 +3639,7 @@ def get_340b_growth_by_drivers_data(query_params: dict = None):
         [
             {"actions": "Closed", "value": 342},
             {"actions": "Resolved (after letter)", "value": 285},
-            {"actions": "Letter Sent", "value": 198},
+            {"actions": LETTER_SENT, "value": 198},
             {"actions": "Open (Unread)", "value": 156},
             {"actions": "False Positive", "value": 124},
             {"actions": "Under Investigation", "value": 98},
@@ -3719,220 +3817,6 @@ def get_anomaly_detail_kpis_data(query_params: dict = None):
             session.close()
 
 
-def validate_dual_series_structure(tile_data: dict, tile_name: str) -> tuple[bool, dict]:
-    """
-    Validate dual-series data structure for dual-line chart tiles.
-    
-    Args:
-        tile_data: The tile data dictionary to validate
-        tile_name: Name of the tile for error reporting
-    
-    Returns:
-        Tuple of (is_valid, error_response_or_empty_dict)
-        - is_valid: True if structure is valid, False otherwise
-        - error_response_or_empty_dict: Error response dict if invalid, empty dict if valid
-    
-    Validates:
-        - Presence of 'categories' and 'series' fields
-        - Series is a list with exactly 2 items for dual-line charts
-        - Each series has required metadata fields (name, data, type, yAxis)
-        - Both series have equal length data arrays
-        - Categories length matches all series data lengths
-        - Data arrays contain only numeric values (including zero/null handling)
-        - yAxis values are 0 and 1 for dual Y-axis configuration
-        - Data type consistency within each series
-        - Specific error messages for each validation failure
-    """
-    if not isinstance(tile_data, dict):
-        return False, create_error_response(
-            "Invalid data structure",
-            "Tile data must be a dictionary",
-            tile_name
-        )
-    
-    # Validate presence of required top-level fields
-    if 'categories' not in tile_data:
-        return False, create_error_response(
-            "Missing categories field",
-            "Dual-line chart data must include 'categories' field",
-            tile_name
-        )
-    
-    if 'series' not in tile_data:
-        return False, create_error_response(
-            "Missing series field",
-            "Dual-line chart data must include 'series' field",
-            tile_name
-        )
-    
-    categories = tile_data['categories']
-    series = tile_data['series']
-    
-    # Validate categories
-    if not isinstance(categories, list):
-        return False, create_error_response(
-            "Invalid categories format",
-            "Categories must be a list",
-            tile_name
-        )
-    
-    if len(categories) == 0:
-        return False, create_error_response(
-            "Empty categories",
-            "Categories list cannot be empty",
-            tile_name
-        )
-    
-    # Validate series structure
-    if not isinstance(series, list):
-        return False, create_error_response(
-            "Invalid series format",
-            "Series must be a list",
-            tile_name
-        )
-    
-    if len(series) != 2:
-        return False, create_error_response(
-            "Invalid series count",
-            f"Dual-line chart must have exactly 2 series, found {len(series)}",
-            tile_name
-        )
-    
-    # Validate each series
-    required_fields = ['name', 'data', 'type', 'yAxis']
-    expected_y_axes = {0, 1}
-    found_y_axes = set()
-    
-    for i, series_item in enumerate(series):
-        if not isinstance(series_item, dict):
-            return False, create_error_response(
-                "Invalid series item format",
-                f"Series item {i} must be a dictionary",
-                tile_name
-            )
-        
-        # Check required fields
-        for field in required_fields:
-            if field not in series_item:
-                return False, create_error_response(
-                    "Missing series metadata",
-                    f"Series item {i} missing required field '{field}'",
-                    tile_name
-                )
-        
-        # Validate series name
-        if not isinstance(series_item['name'], str) or not series_item['name'].strip():
-            return False, create_error_response(
-                "Invalid series name",
-                f"Series item {i} name must be a non-empty string",
-                tile_name
-            )
-        
-        # Validate series data
-        data = series_item['data']
-        if not isinstance(data, list):
-            return False, create_error_response(
-                "Invalid series data format",
-                f"Series item {i} data must be a list",
-                tile_name
-            )
-        
-        # Validate data length matches categories
-        if len(data) != len(categories):
-            return False, create_error_response(
-                "Data length mismatch",
-                f"Series item {i} data length ({len(data)}) does not match categories length ({len(categories)})",
-                tile_name
-            )
-        
-        # Validate data contains only numeric values (including zero/null handling)
-        for j, value in enumerate(data):
-            # Handle null/None values gracefully by converting to 0
-            if value is None:
-                data[j] = 0
-                logger.warning(f"Converted null value to 0 in series '{series_item['name']}' at index {j}")
-                continue
-            
-            # Validate numeric types (int, float)
-            if not isinstance(value, (int, float)):
-                return False, create_error_response(
-                    "Invalid data type",
-                    f"Series '{series_item['name']}' contains non-numeric value at index {j}: expected number, found {type(value).__name__} ({value})",
-                    tile_name
-                )
-            
-            # Handle infinite or NaN values
-            if isinstance(value, float):
-                import math
-                if math.isnan(value):
-                    return False, create_error_response(
-                        "Invalid data value",
-                        f"Series '{series_item['name']}' contains NaN value at index {j}",
-                        tile_name
-                    )
-                if math.isinf(value):
-                    return False, create_error_response(
-                        "Invalid data value",
-                        f"Series '{series_item['name']}' contains infinite value at index {j}",
-                        tile_name
-                    )
-            
-            # Validate reasonable value ranges for volume data (millions of dollars)
-            if 'Volume' in series_item['name'] and '$MM' in series_item['name']:
-                if value < 0:
-                    return False, create_error_response(
-                        "Invalid volume data",
-                        f"Series '{series_item['name']}' contains negative volume value at index {j}: {value}",
-                        tile_name
-                    )
-                if value > 10000:  # Reasonable upper limit for $MM values
-                    logger.warning(f"Unusually large volume value in series '{series_item['name']}' at index {j}: {value}")
-            
-            # Validate reasonable value ranges for anomaly count data
-            if 'Anomalies' in series_item['name'] and 'Detected' in series_item['name']:
-                if value < 0:
-                    return False, create_error_response(
-                        "Invalid anomaly count",
-                        f"Series '{series_item['name']}' contains negative count value at index {j}: {value}",
-                        tile_name
-                    )
-                # Allow both integers and floats for anomaly counts (some data sources may provide floats)
-                # Just ensure the value is non-negative and reasonable
-                if isinstance(value, float) and not (0 <= value <= 10000):
-                    logger.warning(f"Unusually large anomaly count in series '{series_item['name']}' at index {j}: {value}")
-                elif isinstance(value, int) and not (0 <= value <= 10000):
-                    logger.warning(f"Unusually large anomaly count in series '{series_item['name']}' at index {j}: {value}")
-        
-        # Validate series type
-        if not isinstance(series_item['type'], str) or series_item['type'] not in ['line', 'area']:
-            return False, create_error_response(
-                "Invalid series type",
-                f"Series item {i} type must be 'line' or 'area'",
-                tile_name
-            )
-        
-        # Validate yAxis
-        y_axis = series_item['yAxis']
-        if not isinstance(y_axis, int) or y_axis not in [0, 1]:
-            return False, create_error_response(
-                "Invalid yAxis value",
-                f"Series item {i} yAxis must be 0 or 1, found {y_axis}",
-                tile_name
-            )
-        
-        found_y_axes.add(y_axis)
-    
-    # Validate that both Y-axes are used (0 and 1)
-    if found_y_axes != expected_y_axes:
-        return False, create_error_response(
-            "Incomplete yAxis configuration",
-            f"Dual-line chart must use both yAxis 0 and 1, found {sorted(found_y_axes)}",
-            tile_name
-        )
-    
-    return True, {}
-
-
 def validate_dual_series_data_consistency(tile_data: dict, tile_name: str) -> tuple[bool, dict]:
     """
     Validate data consistency within dual-series tiles.
@@ -4053,69 +3937,6 @@ def handle_dual_series_error_scenarios(tile_data: dict, tile_name: str) -> tuple
             tile_name
         )
 
-
-def validate_dual_series_batch_compatibility(tile_data: dict, tile_name: str, all_requested_tiles: list) -> tuple[bool, dict]:
-    """
-    Validate dual-series tiles for batch request compatibility.
-    
-    Args:
-        tile_data: The tile data dictionary to validate
-        tile_name: Name of the tile for error reporting
-        all_requested_tiles: List of all tiles requested in the batch
-    
-    Returns:
-        Tuple of (is_valid, error_response_or_empty_dict)
-        - is_valid: True if compatible with batch request, False otherwise
-        - error_response_or_empty_dict: Error response dict if invalid, empty dict if valid
-    
-    Validates:
-        - Dual-series tiles work correctly alongside single-series tiles
-        - No performance degradation in batch processing
-        - Consistent response format across all tiles in batch
-    """
-    try:
-        # Validate basic dual-series structure
-        structure_valid, structure_error = validate_dual_series_structure(tile_data, tile_name)
-        if not structure_valid:
-            return False, structure_error
-        
-        # Check for potential performance issues with large batch requests
-        if len(all_requested_tiles) > 10:
-            logger.warning(f"Large batch request with {len(all_requested_tiles)} tiles including dual-series tile '{tile_name}' - potential performance impact")
-        
-        # Validate that dual-series data doesn't conflict with other tiles
-        # (This is mainly a structural check - actual conflicts would be frontend-specific)
-        if 'series' in tile_data and len(tile_data['series']) == 2:
-            # Ensure both series have consistent structure for batch processing
-            for i, series in enumerate(tile_data['series']):
-                if not isinstance(series, dict):
-                    return False, create_error_response(
-                        "Batch compatibility error",
-                        f"Dual-series tile '{tile_name}' has invalid series structure for batch processing",
-                        tile_name
-                    )
-                
-                # Check for required fields that frontend expects in batch responses
-                required_batch_fields = ['name', 'data']
-                for field in required_batch_fields:
-                    if field not in series:
-                        return False, create_error_response(
-                            "Batch compatibility error",
-                            f"Dual-series tile '{tile_name}' missing required field '{field}' for batch processing",
-                            tile_name
-                        )
-        
-        return True, {}
-        
-    except Exception as e:
-        logger.error(f"Error validating batch compatibility for dual-series tile {tile_name}: {e}")
-        return False, create_error_response(
-            "Batch validation error",
-            f"Failed to validate batch compatibility for dual-series tile '{tile_name}': {str(e)}",
-            tile_name
-        )
-
-
 def get_anomalous_transactions_data(query_params: dict = None):
     """
     Fetch anomalous transactions data for dual-line chart visualization.
@@ -4211,7 +4032,7 @@ def get_anomalous_transactions_data(query_params: dict = None):
             # Extract and format YearMonth into readable month format (e.g., "Jan '23")
             categories.append(row.TimePeriod)
             anomaly_counts.append(row.anomaly_count or 0)  # Handle nulls by converting to 0
-            volume_amounts.append(float(row.chargeback)/1e6 if row.chargeback else 0) # Handle nulls and ensure float type for volume in millions of dollars
+            volume_amounts.append(round(float(row.chargeback)/1e6,1) if row.chargeback else 0) # Handle nulls and ensure float type for volume in millions of dollars
         
         # Format as dual-series chart data
         chart_data = {
@@ -5433,13 +5254,13 @@ def get_account_detail_anomalies_data(query_params: dict = None):
                 "linkageScore": int(row.linkageScore or 0),
                 "brand": row.brand or "",
                 "anomalyDate": row.date or "",
-                "daysOpen": row.daysOpen or "0 Days",
+                "daysOpen": row.daysOpen or DAYS_OPEN_DEFAULT,
                 "region": row.region or "",
                 # Format monetary values using helper function
                 "chargeback": format_monetary_value(row.chargeback),
                 "wac": format_monetary_value(row.wac),
                 "units": row.units,
-                "dollars": row.dollars,
+                "dollars": format_monetary_value(row.dollars),
                 "state": row.state,
                 "city": row.city,
                 "action": row.action or ""
@@ -5486,6 +5307,106 @@ def get_account_detail_anomalies_data(query_params: dict = None):
             session.close()
 
 
+def get_account_detail_anomalies_overall_data(query_params: dict = None):
+    """
+    Fetch top anomalies by score for a specific account, irrespective of recency.
+    
+    Database View: vwAccountDetailAnomaliesOverall / vwPharmacyDetailAnomaliesOverall
+    
+    Same as account-detail-anomalies but ordered by linkage score descending
+    instead of anomaly date. Shows the highest-scoring anomalies regardless of when
+    they occurred.
+    
+    Args:
+        query_params: Dictionary of query parameters
+            - 340bId (required*): The 340B covered entity ID to retrieve
+            - pharmacyId (required*): The pharmacy ID to retrieve
+            *Note: Exactly one of 340bId or pharmacyId must be provided
+    
+    Returns:
+        Array of anomaly objects (same structure as account-detail-anomalies).
+        On error, returns error object with "error", "message", and "tileName" fields.
+    """
+    tile_name = "account-detail-anomalies-overall"
+    session = None
+    
+    try:
+        # STEP 1: Validate account ID parameters (REQUIRED - exactly one of 340bId or pharmacyId)
+        is_valid, error_response, id_type, id_value = validate_account_id_parameters(query_params, tile_name)
+        if not is_valid:
+            return error_response
+        
+        # STEP 2: Validate optional date parameters (from, to) and limit parameter
+        if query_params:
+            is_valid, error_response = validate_query_parameters(query_params, tile_name)
+            if not is_valid:
+                return error_response
+        
+        # STEP 3: Query database view with appropriate ID filter based on id_type
+        session = get_session()
+        
+        # Query the overall view - ordered by linkage score, not date
+        if id_type == "340B":
+            query = text("""
+                SELECT
+                    anomalyId, accountId, pharmacyId, anomalyEntityName,
+                    linkageScore, brand, date, daysOpen, region,
+                    chargeback, wac, units, dollars, state, city, action
+                FROM vwAccountDetailAnomaliesOverall
+                WHERE `accountId` = :id_value
+            """)
+        else:  # id_type == "Pharmacy"
+            query = text("""
+                SELECT
+                    anomalyId, accountId, pharmacyId, anomalyEntityName,
+                    linkageScore, brand, date, daysOpen, region,
+                    chargeback, wac, units, dollars, state, city, action
+                FROM vwPharmacyDetailAnomaliesOverall
+                WHERE pharmacyId = :id_value
+            """)
+        
+        result = session.execute(query, {"id_value": id_value}).fetchall()
+        
+        # STEP 4: Handle no data scenario by returning empty array
+        if not result:
+            return []
+        
+        # STEP 5: Format monetary values and return array of anomaly objects
+        anomalies = []
+        for row in result:
+            anomaly = {
+                "anomalyId": row.anomalyId or "",
+                "accountId": row.accountId or "",
+                "pharmacyId": row.pharmacyId or "",                
+                "anomalyEntityName": row.anomalyEntityName,
+                "linkageScore": int(row.linkageScore or 0),
+                "brand": row.brand or "",
+                "anomalyDate": row.date or "",
+                "daysOpen": row.daysOpen or DAYS_OPEN_DEFAULT,
+                "region": row.region or "",
+                "chargeback": format_monetary_value(row.chargeback),
+                "wac": format_monetary_value(row.wac),
+                "units": row.units,
+                "dollars": format_monetary_value(row.dollars),
+                "state": row.state,
+                "city": row.city,
+                "action": row.action or ""
+            }
+            anomalies.append(anomaly)
+        
+        return anomalies
+        
+    except ValueError as e:
+        logger.error(f"Validation error in {tile_name}: {e}")
+        return create_error_response(INVALID_PARAMS, str(e), tile_name)
+    except Exception as e:
+        logger.error(f"Error fetching {tile_name} data: {e}")
+        return _classify_database_error(e, tile_name, "vwAccountDetailAnomaliesOverall", is_view=True)
+    finally:
+        if session:
+            session.close()
+
+
 # ============================================================================
 # Dispatch table mapping tile names to their data-fetch functions.
 # Add new database-connected tiles here — no branching logic required.
@@ -5505,6 +5426,7 @@ _TILE_HANDLERS = {
     "top-340b-accounts-by-avg-hcp-purchase":           get_top_340b_accounts_by_avg_hcp_purchase_data,
     # All Anomalies Page
     "anomalies-list":                                  get_anomalies_list_data,
+    "anomalies-list-overall":                          get_anomalies_list_overall_data,
     "anomaly-detail-kpis":                             get_anomaly_detail_kpis_data,
     "anomalous-transactions":                          get_anomalous_transactions_data,
     "anomalies-confidence-accounts":                   get_anomalies_confidence_accounts_data,
@@ -5525,7 +5447,9 @@ _TILE_HANDLERS = {
     "account-detail-covered-entity-purchase-trends":   get_account_detail_covered_entity_purchase_trends_data,
     "account-detail-covered-entity-dispense-trends":   get_account_detail_covered_entity_dispense_trends_data,
     "account-detail-anomalies":                        get_account_detail_anomalies_data,
+    "account-detail-anomalies-overall":                get_account_detail_anomalies_overall_data,
 }
+
 
 
 def get_tile_data(tile_name: str, query_params: dict = None):
@@ -5550,11 +5474,20 @@ def get_tile_data(tile_name: str, query_params: dict = None):
     return TILE_DATA.get(tile_name)
 
 
+
 # ============================================================================
 # API Route Handlers
 # ============================================================================
 
 # Bundle: return all four tiles at once
+
+
+# ============================================================================
+# API Route Handlers
+# ============================================================================
+
+# Bundle: return all four tiles at once
+
 @app.get("/api/v1/tiles")
 @tracer.capture_method
 def get_tiles_bundle():
@@ -5580,7 +5513,7 @@ def get_tiles_bundle():
         # If no tilename specified, return error with consistent format
         if not tilename_param:
             return create_error_response(
-                MISSING_REQUIRED_PARAMETER,
+                "Missing required parameter",
                 "Please specify one or more tile names using ?tilename=tile1,tile2"
             )
         
@@ -5638,6 +5571,6 @@ def get_tiles_bundle():
     except Exception as e:
         logger.error(f"Error in get_tiles_bundle: {e}")
         return create_error_response(
-            INTERNAL_SERVER_ERROR,
+            "Internal server error",
             str(e)
         )
