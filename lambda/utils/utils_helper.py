@@ -7,8 +7,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ---------------- Constants ----------------
-MISSING_REQUIRED_PARAMETER = "Missing required parameter"
 
 # ---------------------------------------------------------------------------
 # Filter helpers
@@ -440,40 +438,6 @@ def get_tile_data(tile_name: str, query_params: dict = None):
     return TILE_DATA.get(tile_name)
 
 
-def validate_tile_name(tile_name: str) -> tuple[bool, str]:
-    """
-    Validate that a tile name follows kebab-case naming convention.
-    
-    Args:
-        tile_name: The tile name to validate
-    
-    Returns:
-        Tuple of (is_valid, error_message)
-        - is_valid: True if the tile name is valid, False otherwise
-        - error_message: Empty string if valid, error description if invalid
-    
-    Examples:
-        >>> validate_tile_name("anomalous-transactions")
-        (True, "")
-        >>> validate_tile_name("anomalousTransactions")
-        (False, "Invalid tile name format. Expected kebab-case (lowercase with hyphens)")
-        >>> validate_tile_name("ANOMALOUS-TRANSACTIONS")
-        (False, "Invalid tile name format. Expected kebab-case (lowercase with hyphens)")
-    """
-    if not tile_name:
-        return False, "Tile name cannot be empty"
-    
-    # Check if tile name follows kebab-case convention
-    # Should be lowercase letters, numbers, and hyphens only
-    # Should not start or end with hyphen
-    # Should not have consecutive hyphens
-    import re
-    kebab_case_pattern = r'^[a-z0-9]+(-[a-z0-9]+)*$'
-    
-    if not re.match(kebab_case_pattern, tile_name):
-        return False, "Invalid tile name format. Expected kebab-case (lowercase with hyphens)"
-    
-    return True, ""
 
 def get_requested_tiles(query_params):
     tilename_param = query_params.get("tilename", "")

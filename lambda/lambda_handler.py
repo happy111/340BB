@@ -36,6 +36,35 @@ from utils.query_templates import (PowerBIReports, OverviewSummaryKPI, OverviewP
                                    AllAnomaliesPageCharts, AllAccountsSummaryKPI, AccountDetailsKPI, PharmacyDetailsKPI,
                                    AccountDetailsCharts, AnomalyDetailsKPI,PurchaseDispenseExp)
 
+from config.constants import (
+    AWS_REGION,
+    INTERNAL_SERVER_ERROR,
+    INVALID_PARAMS,
+    MISSING_REQUIRED_PARAMETER,
+    DISP_LABEL_340B,
+    DISP_LABEL_NON_340B,
+    PUR_LABEL_340B,
+    PUR_LABEL_NON_340B,
+    DAYS_OPEN_DEFAULT,
+    ANOMALY_STR_DATE_FORMAT,
+    UPLOAD_BUCKET_NAME,
+    UPLOAD_URL_EXPIRATION,
+)
+
+from validators.query_validator import (
+    validate_date_format,
+    validate_limit_parameter,
+    validate_account_id,
+    validate_segment_parameter,
+    validate_query_parameters,
+    validate_tile_name,
+    validate_date_range
+)
+
+
+
+
+
 s3_client = boto3.client(
     's3',
     config=Config(signature_version="s3v4"),
@@ -46,38 +75,6 @@ logger = Logger()
 tracer = Tracer()
 cors_config = CORSConfig(allow_origin="*")
 app = APIGatewayRestResolver(cors=cors_config)
-
-# ---------------- Constants ----------------
-ALLOWED_HEADERS = "Content-Type,Authorization"
-ALLOWED_METHODS = "OPTIONS,GET,POST,PUT,PATCH,DELETE,HEAD"
-ALLOWED_ORIGIN = "*"
-ANOMALY_STR_DATE_FORMAT = "%m/%d/%Y"
-AWS_REGION="us-east-1"
-CONNECTION_FAILED = "Database connection failed"
-DAYS_OPEN_DEFAULT = "0 Days"
-DISP_LABEL_340B = "340B Dispense Quantity"
-DISP_LABEL_NON_340B = "Non 340B Dispense Quantity"
-DISPENSE_QUANTITY = "Dispense Quantity"
-EITHER_340BID_OR_PHARMACYID_REQUIRED = "Either 340bId or pharmacyId must be provided"
-ERROR_CONNECTION = "Unable to connect to database. Please try again later."
-ERROR_DOES_NOT_EXIST = "doesn't exist"
-ERROR_UNKNOWN_TABLE = "unknown table"
-INTERNAL_SERVER_ERROR = "Internal server error"
-INVALID_PARAMS = "Invalid parameters"
-INVALID_TIME_PERIOD = "Invalid time period"
-LETTER_SENT = "Letter Sent"
-MISSING_REQUIRED_PARAMETER = "Missing required parameter"
-NO_DATA_AVAILABLE = "No data available"
-NO_DATA_AVAILABLE_FOR_SPECIFIED_PARAMETERS = "No data available for the specified parameters"
-NO_DATA_FOUND = "No data found"
-PUR_LABEL_340B = "340B Purchase Quantity"
-PUR_LABEL_NON_340B = "Non 340B Purchase Quantity"
-PURCHASE_QUANTITY = "Purchase Quantity"
-THE_VIEW_RETURNED_NO_DATA = "The view returned no data"
-UPLOAD_BUCKET_NAME = os.getenv("DD340B_BUCKET_NAME", "default-340b-bucket") # bucket name fetched from cdk.json
-UPLOAD_URL_EXPIRATION = 120 # 2 minutes expiration for presigned url
-VIEW_NOT_FOUND = "View not found"
-MISSING_REQUIRED_PARAMETER = "Missing required parameter"
 
 
 @lru_cache(maxsize=1)
@@ -1052,104 +1049,6 @@ TILE_DATA = {
 # Helper Functions
 # ============================================================================
 
-def validate_date_format(date_string: str) -> tuple[bool, str]:
-    """
-    Validate that a date string is in ISO 8601 format (YYYY-MM-DD).
-    
-    Args:
-        date_string: The date string to validate
-    
-    Returns:
-        Tuple of (is_valid, error_message)
-        - is_valid: True if the date is valid, False otherwise
-        - error_message: Empty string if valid, error description if invalid
-    
-    Examples:
-        >>> validate_date_format("2025-01-15")
-        (True, "")
-        >>> validate_date_format("2025-1-15")
-        (False, "Invalid date format. Expected ISO 8601 format (YYYY-MM-DD)")
-        >>> validate_date_format("invalid")
-        (False, "Invalid date format. Expected ISO 8601 format (YYYY-MM-DD)")
-    """
-    if not date_string:
-        return True, ""  # Empty/None dates are valid (optional parameter)
-    
-    try:
-        # Attempt to parse the date string
-        parsed_date = datetime.strptime(date_string, "%Y-%m-%d")
-        
-        # Verify the format matches exactly (prevents dates like "2025-1-5" from passing)
-        if date_string != parsed_date.strftime("%Y-%m-%d"):
-            return False, "Invalid date format. Expected ISO 8601 format (YYYY-MM-DD)"
-        
-        return True, ""
-    except ValueError:
-        return False, "Invalid date format. Expected ISO 8601 format (YYYY-MM-DD)"
-
-
-def validate_segment_parameter(segment: str) -> tuple[bool, str]:
-    """
-    Validate that a segment parameter is one of the allowed values.
-    
-    Args:
-        segment: The segment string to validate
-    
-    Returns:
-        Tuple of (is_valid, error_message)
-        - is_valid: True if the segment is valid, False otherwise
-        - error_message: Empty string if valid, error description if invalid
-    
-    Examples:
-        >>> validate_segment_parameter("340B")
-        (True, "")
-        >>> validate_segment_parameter("non-340B")
-        (True, "")
-        >>> validate_segment_parameter("invalid")
-        (False, "Invalid segment value. Expected '340B' or 'non-340B'")
-    """
-    if not segment:
-        return True, ""  # Empty/None segment is valid (optional parameter)
-    
-    allowed_segments = ["340B", "non-340B"]
-    if segment not in allowed_segments:
-        return False, f"Invalid segment value. Expected '340B' or 'non-340B', got '{segment}'"
-    
-    return True, ""
-
-
-def validate_limit_parameter(limit: str) -> tuple[bool, str, int]:
-    """
-    Validate and convert a limit parameter to integer.
-    
-    Args:
-        limit: The limit string to validate and convert
-    
-    Returns:
-        Tuple of (is_valid, error_message, converted_value)
-        - is_valid: True if the limit is valid, False otherwise
-        - error_message: Empty string if valid, error description if invalid
-        - converted_value: Integer value if valid, None if invalid
-    
-    Examples:
-        >>> validate_limit_parameter("10")
-        (True, "", 10)
-        >>> validate_limit_parameter("invalid")
-        (False, "Invalid limit parameter. Expected positive integer", None)
-        >>> validate_limit_parameter("-5")
-        (False, "Invalid limit parameter. Expected positive integer", None)
-    """
-    if not limit:
-        return True, "", None  # Empty/None limit is valid (optional parameter)
-    
-    try:
-        limit_int = int(limit)
-        if limit_int <= 0:
-            return False, "Invalid limit parameter. Expected positive integer", None
-        return True, "", limit_int
-    except (ValueError, TypeError):
-        return False, "Invalid limit parameter. Expected positive integer", None
-
 
 
 def _classify_database_error(exception: Exception, tile_name: str, table_name: str = "database table", is_view: bool = False) -> dict:
@@ -1189,147 +1088,6 @@ def _classify_database_error(exception: Exception, tile_name: str, table_name: s
     )
 
 
-def validate_account_id_parameters(query_params: dict, tile_name: str) -> tuple[bool, dict, str, str]:
-    """
-    Validate that exactly one of 340bId or pharmacyId is provided.
-    
-    This function enforces the mutual exclusivity requirement for account ID parameters.
-    Exactly one of 340bId or pharmacyId must be provided, but not both and not neither.
-    
-    Args:
-        query_params: Dictionary of query parameters to validate
-        tile_name: Name of the tile for error reporting
-    
-    Returns:
-        Tuple of (is_valid, error_response, id_type, id_value)
-        - is_valid: True if validation passes, False otherwise
-        - error_response: Error response dict if invalid, empty dict if valid
-        - id_type: "340B" or "Pharmacy" if valid, None if invalid
-        - id_value: The ID value if valid, None if invalid
-    
-    Examples:
-        >>> validate_account_id_parameters({"340bId": "123"}, "test-tile")
-        (True, {}, "340B", "123")
-        >>> validate_account_id_parameters({"pharmacyId": "456"}, "test-tile")
-        (True, {}, "Pharmacy", "456")
-        >>> validate_account_id_parameters({}, "test-tile")
-        (False, {"error": "Missing required parameter", ...}, None, None)
-        >>> validate_account_id_parameters({"340bId": "123", "pharmacyId": "456"}, "test-tile")
-        (False, {"error": "Invalid parameters", ...}, None, None)
-    
-    Validates: Requirements 10.1, 10.2
-    """
-    if not query_params:
-        return False, {
-            "error": MISSING_REQUIRED_PARAMETER,
-            "message": EITHER_340BID_OR_PHARMACYID_REQUIRED,
-            "tileName": tile_name
-        }, None, None
-    
-    # Extract both parameters
-    id_340b = query_params.get('340bId')
-    pharmacy_id = query_params.get('pharmacyId')
-    
-    # Check if neither parameter is provided
-    if not id_340b and not pharmacy_id:
-        return False, {
-            "error": MISSING_REQUIRED_PARAMETER,
-            "message": EITHER_340BID_OR_PHARMACYID_REQUIRED,
-            "tileName": tile_name
-        }, None, None
-    
-    # Check if both parameters are provided
-    if id_340b and pharmacy_id:
-        return False, {
-            "error": INVALID_PARAMS,
-            "message": "Cannot specify both 340bId and pharmacyId. Provide exactly one.",
-            "tileName": tile_name
-        }, None, None
-    
-    # Validate 340bId if provided
-    if id_340b:
-        if not id_340b.strip():
-            return False, {
-                "error": INVALID_PARAMS,
-                "message": "340bId parameter cannot be empty",
-                "tileName": tile_name
-            }, None, None
-        return True, {}, "340B", id_340b.strip()
-    
-    # Validate pharmacyId (must be the one provided at this point)
-    if not pharmacy_id.strip():
-        return False, {
-            "error": "Invalid parameters",
-            "message": "pharmacyId parameter cannot be empty",
-            "tileName": tile_name
-        }, None, None
-    return True, {}, "Pharmacy", pharmacy_id.strip()
-
-
-def validate_query_parameters(query_params: dict, tile_name: str) -> tuple[bool, dict]:
-    """
-    Validate common query parameters for tile requests.
-    
-    Args:
-        query_params: Dictionary of query parameters to validate
-        tile_name: Name of the tile for error reporting
-    
-    Returns:
-        Tuple of (is_valid, error_response_or_empty_dict)
-        - is_valid: True if all parameters are valid, False otherwise
-        - error_response_or_empty_dict: Error response dict if invalid, empty dict if valid
-    
-    Validates:
-        - from: ISO 8601 date format (YYYY-MM-DD)
-        - to: ISO 8601 date format (YYYY-MM-DD)
-        - segment: "340B" or "non-340B"
-        - limit: Positive integer
-        - region: Non-empty string
-    """
-    if not query_params:
-        return True, {}
-    
-    # Validate date parameters ('from' and 'to')
-    for param_name in ('from', 'to'):
-        is_valid, error_resp = validate_optional_param(
-            query_params, param_name, validate_date_format, "Invalid date format", tile_name
-        )
-        if not is_valid:
-            return False, error_resp
-    
-    # Validate 'segment' parameter
-    is_valid, error_resp = validate_optional_param(
-        query_params, 'segment', validate_segment_parameter, "Invalid segment value", tile_name
-    )
-    if not is_valid:
-        return False, error_resp
-    
-    # Validate 'limit' parameter
-    is_valid, error_resp = validate_optional_param(
-        query_params, 'limit', validate_limit_parameter, "Invalid limit parameter", tile_name
-    )
-    if not is_valid:
-        return False, error_resp
-    
-    # Validate 'region' parameter (if present, should be non-empty string)
-    region = query_params.get('region')
-    if region is not None and not region.strip():
-        return False, create_error_response(
-            "Invalid region parameter",
-            "Region parameter cannot be empty",
-            tile_name
-        )
-
-    time_period = query_params.get('time-period')
-    valid_time_periods = ["quarterly", "monthly", "half-yearly", "yearly"]
-    if time_period and time_period not in valid_time_periods:
-        return False, create_error_response(
-            INVALID_TIME_PERIOD,
-            f"'time-period' parameter must be one of {valid_time_periods} but got {time_period}",
-            tile_name
-        )
-
-    return True, {}
 
 
 def generate_global_filters_from_query_params(query_params: dict, column_map: dict) -> str:
